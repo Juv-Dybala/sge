@@ -71,6 +71,7 @@ class ProteinSGEConfig(ProteinConfig):
                  max_sequence_length: int = 32, # include <cls> etc.
                  num_path: int = 3,
                  path_length: int = 5,
+                 beta: float = 1.0,
                  **kwargs):
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
@@ -88,6 +89,7 @@ class ProteinSGEConfig(ProteinConfig):
         self.max_sequence_length = max_sequence_length
         self.num_path = num_path
         self.path_length = path_length
+        self.beta = beta
 
 
 class ProteinSGEAbstractModel(ProteinModel):
@@ -117,12 +119,17 @@ class ProteinSGEEmbeddingBias(nn.Module):
         super().__init__()
         self.node_embeddings = nn.Embedding(
             config.vocab_size, config.hidden_size, padding_idx=0)
-        
+        self.linear = nn.Linear(
+            config.hidden_size,config.hidden_size,bias=False)
+
     def forward(self, walk_paths):
         # RW\ARW
         # walk_paths: [batch_size x seq_length x num_path x path_length]
-        walk_paths = self.node_embeddings(walk_paths)
-        path_embedding = torch.mean(walk_paths,dim=(2,3))
+        walk_paths = self.node_embeddings(walk_paths) 
+        # path_embedding = torch.mean(walk_paths,dim=(2,3)) # [batch_size x hidden_size]
+        path_embedding = torch.sum(walk_paths,dim=(2,3))
+        # path_embedding = self.linear(path_embedding)
+
         return path_embedding
 
 
@@ -226,6 +233,7 @@ class ProteinSGESelfAttention(nn.Module):
         self.value = nn.Linear(config.hidden_size, self.all_head_size)
 
         self.attn_bias = ProteinSGESelfAttentionBias(config)
+        self.beta = config.beta
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
@@ -255,7 +263,7 @@ class ProteinSGESelfAttention(nn.Module):
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
         
         attn_bias = self.attn_bias(distance,random_walk,anonymous_random_walk)
-        attention_scores = attention_scores + attn_bias
+        attention_scores = attention_scores + attn_bias * self.beta
         
         # Apply the attention mask is (precomputed for all layers in
         # ProteinBertModel forward() function)

@@ -18,6 +18,10 @@ from .registry import registry
 
 logger = logging.getLogger(__name__)
 
+NUM_PATH = 3
+WALK_LENGTH = 5
+DEVIDE_LENGTH = 30
+
 
 def dataset_factory(data_file: Union[str, Path], *args, **kwargs) -> Dataset:
     data_file = Path(data_file)
@@ -127,10 +131,10 @@ def generate_random_walk(start_node: object, node_neighbors: Dict[object,List],
 
 
 def preprocess(sequence: Sequence):
-    # sequence是经过tokenizer的数字序列（处理起止符？）
+    # sequence是经过tokenizer的数字序列（处理起止符）
     # 包括两部分：计算节点对之间距离，相同节点之间连接边
-    num_path = 3
-    walk_length = 5
+    num_path = NUM_PATH
+    walk_length = WALK_LENGTH
 
     sequence = sequence[1:-1]
 
@@ -197,6 +201,30 @@ def preprocess(sequence: Sequence):
 
     return RW,ARW,distance_matrix
     
+
+def to_Graph(sequence: Sequence):
+    # sequence是经过tokenizer的数字序列（处理起止符）
+    sequence = sequence[1:-1]
+    x = list(set(sequence))
+    
+    edges = {}
+    for k in range(len(sequence)-1):
+        edge = (sequence[k],sequence[k+1])
+        if edge in edges:
+            edges[edge] += 1
+        else:
+            edges[edge] = 1
+
+    edge_index = []
+    edge_attr = []
+    for index,val in edges.items():
+        edge_index.append(index)
+        edge_attr.append(val)
+    edge_index = np.array(edge_index)
+    
+    print((len(x),edge_index.shape,len(edge_attr)))
+    return x,edge_index,edge_attr
+
 
 class FastaDataset(Dataset):
     """Creates a dataset from a fasta file.
@@ -636,7 +664,7 @@ class StabilityDataset(Dataset):
 
     def __getitem__(self, index: int):
         item = self.data[index]
-        sub_sequences = devide_sequence(item['primary'],max_length=30)
+        sub_sequences = devide_sequence(item['primary'],max_length=DEVIDE_LENGTH)
         token_ids = []
         input_masks = []
         rws = []
@@ -667,11 +695,11 @@ class StabilityDataset(Dataset):
         input_ids, input_mask, stability_true_value, index, \
             random_walk, anonymous_random_walk, distance = tuple(zip(*batch))
         
-        input_ids = torch.from_numpy(np.vstack(input_ids))
-        input_mask = torch.from_numpy(np.vstack(input_mask))
-        random_walk = torch.from_numpy(np.concatenate(random_walk,axis=0)).long()
-        anonymous_random_walk = torch.from_numpy(np.concatenate(anonymous_random_walk,axis=0)).long()
-        distance = torch.from_numpy(np.concatenate(distance,axis=0)).long()
+        input_ids = torch.from_numpy(np.vstack(pad_sequences(input_ids,0)))
+        input_mask = torch.from_numpy(np.vstack(pad_sequences(input_mask,0)))
+        random_walk = torch.from_numpy(np.concatenate(pad_sequences(random_walk,0),axis=0)).long()
+        anonymous_random_walk = torch.from_numpy(np.concatenate(pad_sequences(anonymous_random_walk,0),axis=0)).long()
+        distance = torch.from_numpy(np.concatenate(pad_sequences(distance,-1),axis=0)).long()
     
         stability_true_value = torch.FloatTensor(stability_true_value)  # type: ignore
         stability_true_value = stability_true_value.unsqueeze(1)
