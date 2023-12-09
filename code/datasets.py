@@ -4,7 +4,7 @@ from pathlib import Path
 import pickle as pkl
 import logging
 import random
-import networkx as nx
+from torch_geometric.data import Data, Batch
 
 import lmdb
 import numpy as np
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 NUM_PATH = 3
 WALK_LENGTH = 5
-DEVIDE_LENGTH = 30
+DEVIDE_LENGTH = 26
 
 
 def dataset_factory(data_file: Union[str, Path], *args, **kwargs) -> Dataset:
@@ -202,14 +202,14 @@ def preprocess(sequence: Sequence):
     return RW,ARW,distance_matrix
     
 
-def to_Graph(sequence: Sequence):
+def to_Graph(sequence: Sequence) -> Data:
     # sequence是经过tokenizer的数字序列（处理起止符）
     sequence = sequence[1:-1]
     x = list(set(sequence))
     
     edges = {}
     for k in range(len(sequence)-1):
-        edge = (sequence[k],sequence[k+1])
+        edge = (x.index(sequence[k]),x.index(sequence[k+1]))
         if edge in edges:
             edges[edge] += 1
         else:
@@ -220,10 +220,15 @@ def to_Graph(sequence: Sequence):
     for index,val in edges.items():
         edge_index.append(index)
         edge_attr.append(val)
-    edge_index = np.array(edge_index)
-    
-    print((len(x),edge_index.shape,len(edge_attr)))
-    return x,edge_index,edge_attr
+    edge_index = np.array(edge_index).T
+    edge_index = torch.from_numpy(np.array(edge_index))
+    x = torch.Tensor(x).unsqueeze(1).long()
+    edge_attr = torch.Tensor(edge_attr).unsqueeze(1)
+
+    graph_data = Data(x=x,edge_index=edge_index,edge_attr=edge_attr)
+    graph_data.num_nodes = x.shape[0]
+    graph_data.num_edges = edge_index.shape[1]
+    return graph_data
 
 
 class FastaDataset(Dataset):
@@ -664,39 +669,46 @@ class StabilityDataset(Dataset):
 
     def __getitem__(self, index: int):
         item = self.data[index]
+        score = float(item['stability_score'][0])
+        token_ids = self.tokenizer.encode(item['primary'])
+        input_mask = np.ones_like(token_ids)
+        graph_data = to_Graph(token_ids)
+
         sub_sequences = devide_sequence(item['primary'],max_length=DEVIDE_LENGTH)
-        token_ids = []
-        input_masks = []
+        devided_token_ids = []
+        devided_input_masks = []
         rws = []
         arws = []
         distances = [] 
         for session in sub_sequences:
-            token_id = self.tokenizer.encode(session)
-            input_mask = np.ones_like(token_id)
-            random_walk,anonymous_random_walk,distance = preprocess(token_id)
+            devided_token_id = self.tokenizer.encode(session)
+            devided_input_mask = np.ones_like(devided_token_id)
+            random_walk,anonymous_random_walk,distance = preprocess(devided_token_id)
 
-            token_ids.append(token_id)
-            input_masks.append(input_mask)
+            devided_token_ids.append(devided_token_id)
+            devided_input_masks.append(devided_input_mask)
             rws.append(random_walk)
             arws.append(anonymous_random_walk)
             distances.append(distance)
-        
-        token_ids = np.vstack(pad_sequences(token_ids,0))
-        input_masks = np.vstack(pad_sequences(input_masks,0))
+
+        devided_token_ids = np.vstack(pad_sequences(devided_token_ids,0))
+        devided_input_masks = np.vstack(pad_sequences(devided_input_masks,0))
         rws = np.array(pad_sequences(rws,0))
         arws = np.array(pad_sequences(arws,0))
         distances = np.array(pad_sequences(distances,-1))
-        
-        score = float(item['stability_score'][0])
-        return token_ids, input_masks, score, len(sub_sequences), \
-                rws, arws, distances
+             
+        return token_ids, input_mask, score, graph_data, len(sub_sequences), \
+                devided_token_ids, devided_input_masks, rws, arws, distances, 
 
     def collate_fn(self, batch: List[Tuple[Any, ...]]) -> Dict[str, torch.Tensor]:
-        input_ids, input_mask, stability_true_value, index, \
-            random_walk, anonymous_random_walk, distance = tuple(zip(*batch))
+        input_ids, input_mask, stability_true_value, graph_data, index, \
+            devided_input_ids, devided_input_mask, random_walk, \
+                anonymous_random_walk, distance  = tuple(zip(*batch))
         
-        input_ids = torch.from_numpy(np.vstack(pad_sequences(input_ids,0)))
-        input_mask = torch.from_numpy(np.vstack(pad_sequences(input_mask,0)))
+        input_ids = torch.from_numpy(pad_sequences(input_ids, 0))
+        input_mask = torch.from_numpy(pad_sequences(input_mask, 0))
+        devided_input_ids = torch.from_numpy(np.vstack(pad_sequences(devided_input_ids,0)))
+        devided_input_mask = torch.from_numpy(np.vstack(pad_sequences(devided_input_mask,0)))
         random_walk = torch.from_numpy(np.concatenate(pad_sequences(random_walk,0),axis=0)).long()
         anonymous_random_walk = torch.from_numpy(np.concatenate(pad_sequences(anonymous_random_walk,0),axis=0)).long()
         distance = torch.from_numpy(np.concatenate(pad_sequences(distance,-1),axis=0)).long()
@@ -705,13 +717,18 @@ class StabilityDataset(Dataset):
         stability_true_value = stability_true_value.unsqueeze(1)
         index = torch.IntTensor(index)
 
+        graph_data = Batch.from_data_list(graph_data)
+
         return {'input_ids': input_ids,
                 'input_mask': input_mask,
                 'targets': stability_true_value,
+                'devided_input_ids': devided_input_ids,
+                'devided_input_mask': devided_input_mask,
                 'session_index':index,
                 'random_walk': random_walk,
                 'anonymous_random_walk': anonymous_random_walk,
-                'distance': distance}
+                'distance': distance,
+                'graph_data': graph_data }
 
 
 @registry.register_task('remote_homology', num_labels=1195)

@@ -68,7 +68,7 @@ class ProteinSGEConfig(ProteinConfig):
                  type_vocab_size: int = 2,
                  initializer_range: float = 0.02,
                  layer_norm_eps: float = 1e-12,
-                 max_sequence_length: int = 32, # include <cls> etc.
+                 max_sequence_length: int = 55, # include <cls> etc.
                  num_path: int = 3,
                  path_length: int = 5,
                  beta: float = 1.0,
@@ -90,6 +90,7 @@ class ProteinSGEConfig(ProteinConfig):
         self.num_path = num_path
         self.path_length = path_length
         self.beta = beta
+
 
 
 class ProteinSGEAbstractModel(ProteinModel):
@@ -126,9 +127,8 @@ class ProteinSGEEmbeddingBias(nn.Module):
         # RW\ARW
         # walk_paths: [batch_size x seq_length x num_path x path_length]
         walk_paths = self.node_embeddings(walk_paths) 
-        # path_embedding = torch.mean(walk_paths,dim=(2,3)) # [batch_size x hidden_size]
-        path_embedding = torch.sum(walk_paths,dim=(2,3))
-        # path_embedding = self.linear(path_embedding)
+        path_embedding = torch.mean(walk_paths,dim=(2,3)) # [batch_size x hidden_size]
+        path_embedding = self.linear(path_embedding)
 
         return path_embedding
 
@@ -141,6 +141,7 @@ class ProteinSGESelfAttentionBias(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
+        self.beta = config.beta
 
         self.path_embedding = ProteinSGEEmbeddingBias(config)
         self.distance_embedding = nn.Embedding(
@@ -154,7 +155,7 @@ class ProteinSGESelfAttentionBias(nn.Module):
     def forward(self, distance, random_walk=None, anonymous_random_walk=None):
         distance = torch.add(distance,1)
         distance_rpe = self.distance_embedding(distance).permute(0,3,1,2)
-        attn_bias = distance_rpe
+        attn_bias = distance_rpe * self.beta
         
         if random_walk is not None:
             rw_embedding = self.path_embedding(random_walk)
@@ -171,6 +172,7 @@ class ProteinSGESelfAttentionBias(nn.Module):
 
 
 class ProteinSGEEmbeddings(nn.Module):
+    # 加APE
     """Construct the embeddings from word, position and token_type embeddings.
     """
     def __init__(self, config):
@@ -215,7 +217,7 @@ class ProteinSGEEmbeddings(nn.Module):
 
 
 class ProteinSGESelfAttention(nn.Module):
-    #TODO: 加RPE
+    # 加RPE
     def __init__(self, config):
         super().__init__()
         if config.hidden_size % config.num_attention_heads != 0:
@@ -233,7 +235,6 @@ class ProteinSGESelfAttention(nn.Module):
         self.value = nn.Linear(config.hidden_size, self.all_head_size)
 
         self.attn_bias = ProteinSGESelfAttentionBias(config)
-        self.beta = config.beta
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
@@ -263,7 +264,7 @@ class ProteinSGESelfAttention(nn.Module):
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
         
         attn_bias = self.attn_bias(distance,random_walk,anonymous_random_walk)
-        attention_scores = attention_scores + attn_bias * self.beta
+        attention_scores = attention_scores + attn_bias
         
         # Apply the attention mask is (precomputed for all layers in
         # ProteinBertModel forward() function)
@@ -474,16 +475,28 @@ class ProteinSGEAggregator(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.gru = nn.GRU(config.hidden_size,config.hidden_size)
+        self.hidden_size = config.hidden_size
     
     def forward(self, sequence_output, pooled_output, session_index):
         session_index = session_index.tolist()
         
         # aggregate sequence_output (token level)
-        # TODO: 重组起止符，加入相同token的聚合，目前仅简单concatenate
+        # 目前仅重组起止符并简单concatenate
         sequence_output = list(torch.split(sequence_output,session_index,dim=0))
-        for i in range(len(sequence_output)):         
-            sequence_output[i] = torch.cat(tuple(sequence_output[i]),dim=0)
-        sequence_output = tuple(sequence_output)
+        for i in range(len(sequence_output)):
+            num_of_subsequences = sequence_output[i].shape[0]
+            if num_of_subsequences == 1:
+                continue
+            subsequences = []
+            subsequences.append(sequence_output[i][0,:-1,:])
+            for j in range(1,num_of_subsequences-1):
+                subsequences.append(sequence_output[i][j,1:-1,:])
+            subsequences.append(sequence_output[i][-1,1:,:])
+            subsequences.append(torch.zeros((num_of_subsequences*2-2,self.hidden_size)) \
+                                .to(device=sequence_output[i].device))
+
+            sequence_output[i] = torch.cat(subsequences,dim=0)
+        sequence_output = torch.stack(sequence_output,dim=0)
 
         # aggregate pooled_output (sequence level)
         # 使用GRU聚合
@@ -528,15 +541,17 @@ class ProteinSGEModel(ProteinSGEAbstractModel):
         for layer, heads in heads_to_prune.items():
             self.encoder.layer[layer].attention.prune_heads(heads)
 
-    def forward(self, input_ids, input_mask=None,session_index=None,
+    def forward(self, input_ids, devided_input_ids, devided_input_mask=None,session_index=None,
                 random_walk=None, anonymous_random_walk=None, distance=None):
         """ Runs the forward model pass
 
         Args:
-            input_ids (Tensor[long]):
+            input_ids (Tensor[long]): Unused
+                Tensor of input symbols of shape [batch_size x whole_sequence_length]
+            devided_input_ids (Tensor[long]):
                 Tensor of input symbols of shape [sub_batch_size x sequence_length]
-            input_mask (Tensor[bool]):
-                Tensor of booleans w/ same shape as input_ids, indicating whether
+            devided_input_mask (Tensor[bool]):
+                Tensor of booleans w/ same shape as devided_input_ids, indicating whether
                 a given sequence position is valid
             session_index (Tensor[int]):
                 Tensor of the sub_sequence of each bacth,
@@ -555,8 +570,7 @@ class ProteinSGEModel(ProteinSGEAbstractModel):
             pooled_embedding (Tensor[float]):    SEQ_LEVEL
                 Pooled representation of the entire sequence of size [batch_size x hidden_size]
         """
-
-        extended_attention_mask = input_mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = devided_input_mask.unsqueeze(1).unsqueeze(2)
 
         # Since input_mask is 1.0 for positions we want to attend and 0.0 for
         # masked positions, this operation will create a tensor which is 0.0 for
@@ -566,7 +580,7 @@ class ProteinSGEModel(ProteinSGEAbstractModel):
         extended_attention_mask = extended_attention_mask.to(
             dtype=next(self.parameters()).dtype)  # fp16 compatibility
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-        embedding_output = self.embeddings(input_ids,
+        embedding_output = self.embeddings(devided_input_ids,
                                            random_walk=random_walk,
                                            anonymous_random_walk=anonymous_random_walk)
         
@@ -644,14 +658,14 @@ class ProteinSGEForValuePrediction(ProteinSGEAbstractModel):
 
         self.init_weights()
 
-    def forward(self, input_ids, input_mask=None, targets=None, session_index=None,
+    def forward(self, input_ids, devided_input_ids, devided_input_mask=None, targets=None, session_index=None,
                 random_walk=None, anonymous_random_walk=None, distance=None):
 
         # targets、session_index: [batch_size]
         # random_walk、anonymous_random_walk: [sub_batch_size x sequence_length x path_num x path_length]
         # distance: [sub_batch_size x sequence_length x sequence_length]
 
-        outputs = self.sge(input_ids, input_mask, session_index, 
+        outputs = self.sge(input_ids, devided_input_ids, devided_input_mask, session_index, 
                            random_walk, anonymous_random_walk,distance)
 
         sequence_output, pooled_output = outputs[:2]
