@@ -30,7 +30,7 @@ class ProteinGNNConfig(ProteinConfig):
                  hidden_size: int = 1024,
                  hidden_dropout_prob: float = 0.1,
                  initializer_range: float = 0.02,
-                 network_type: str = "GCN",
+                 network_type: str = "GraphSAGE",
                  **kwargs):
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
@@ -81,10 +81,11 @@ class ProteinGraphSAGEModel(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
     
     def forward(self, x, edge_index, edge_attr):
-        x = self.sage1(x,edge_index,edge_attr)
+        # GraphSAGE原论文未使用边信息
+        x = self.sage1(x,edge_index)
         x = F.relu(x)
         x = self.dropout(x)
-        x = self.sage2(x,edge_index,edge_attr)
+        x = self.sage2(x,edge_index)
         return x
     
 
@@ -130,7 +131,7 @@ class ProteinGNNOutput(nn.Module):
             
             sequence_output = torch.vstack(sequence_output)
             sequence_outputs.append(sequence_output)
-        
+
         graph_outputs = torch.vstack(graph_outputs)
         sequence_outputs = tuple(sequence_outputs)
             
@@ -177,6 +178,7 @@ class ProteinGNNModel(ProteinGNNAbstractModel):
 
         node_index = x
         x = self.embedding(x).squeeze()
+
         x = self.gnn_model(x, edge_index, edge_attr) # [node_num x hidden_size]
         sequence_output,pooled_outputs = self.output(input_ids, node_index, x, ptr)
         
@@ -206,4 +208,78 @@ class ProteinGNNForValuePrediction(ProteinGNNAbstractModel):
         sequence_output, pooled_output = outputs
         outputs = self.predict(pooled_output, targets)
         # (loss), prediction_scores
+        return outputs
+
+
+@registry.register_task_model('remote_homology', 'gnn')
+class ProteinGNNForSequenceClassification(ProteinGNNAbstractModel):
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.gnn = ProteinGNNModel(config)
+        self.classify = SequenceClassificationHead(
+            config.hidden_size, config.num_labels)
+
+        self.init_weights()
+
+    def forward(self, input_ids, graph_data, targets):
+        # print(graph_data)
+        x, edge_index, edge_attr = graph_data.x, graph_data.edge_index, graph_data.edge_attr
+        ptr = graph_data.ptr
+        
+        outputs = self.gnn(input_ids, x, edge_index, edge_attr, ptr)
+
+        sequence_output, pooled_output = outputs
+        outputs = self.classify(pooled_output, targets)
+        # (loss), prediction_scores
+        return outputs
+
+
+@registry.register_task_model('secondary_structure', 'gnn')
+class ProteinGNNForSequenceToSequenceClassification(ProteinGNNAbstractModel):
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.gnn = ProteinGNNModel(config)
+        self.classify = SequenceToSequenceClassificationHead(
+            config.hidden_size, config.num_labels, ignore_index=-1)
+
+        self.init_weights()
+
+    def forward(self, input_ids, graph_data, targets):
+
+        x, edge_index, edge_attr = graph_data.x, graph_data.edge_index, graph_data.edge_attr
+        ptr = graph_data.ptr
+        
+        outputs = self.gnn(input_ids, x, edge_index, edge_attr, ptr)
+
+        sequence_output, pooled_output = outputs[:2]
+        outputs = self.classify(sequence_output, targets) + outputs[2:]
+        # (loss), prediction_scores, (hidden_states), (attentions)
+        return outputs
+
+
+@registry.register_task_model('contact_prediction', 'gnn')
+class ProteinGNNForContactPrediction(ProteinGNNAbstractModel):
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.gnn = ProteinGNNModel(config)
+        self.predict = PairwiseContactPredictionHead(config.hidden_size, ignore_index=-1)
+
+        self.init_weights()
+
+    def forward(self, input_ids, protein_length, graph_data, targets):
+
+        x, edge_index, edge_attr = graph_data.x, graph_data.edge_index, graph_data.edge_attr
+        ptr = graph_data.ptr
+        
+        outputs = self.gnn(input_ids, x, edge_index, edge_attr, ptr)
+
+        sequence_output, pooled_output = outputs[:2]
+        outputs = self.predict(sequence_output, protein_length, targets) + outputs[2:]
+        # (loss), prediction_scores, (hidden_states), (attentions)
         return outputs

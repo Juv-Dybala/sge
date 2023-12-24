@@ -18,9 +18,9 @@ from .registry import registry
 
 logger = logging.getLogger(__name__)
 
-NUM_PATH = 3
-WALK_LENGTH = 5
-DEVIDE_LENGTH = 26
+NUM_PATH = 7
+WALK_LENGTH = 15
+DEVIDE_LENGTH = 100
 
 
 def dataset_factory(data_file: Union[str, Path], *args, **kwargs) -> Dataset:
@@ -39,9 +39,12 @@ def dataset_factory(data_file: Union[str, Path], *args, **kwargs) -> Dataset:
         raise ValueError(f"Unrecognized datafile type {data_file.suffix}")
 
 
-def pad_sequences(sequences: Sequence, constant_value=0, dtype=None) -> np.ndarray:
+def pad_sequences(sequences: Sequence, constant_value=0, devided_shape=None, dtype=None) -> np.ndarray:
     batch_size = len(sequences)
-    shape = [batch_size] + np.max([seq.shape for seq in sequences], 0).tolist()
+    if devided_shape:
+        shape = [batch_size] + devided_shape
+    else:
+        shape = [batch_size] + np.max([seq.shape for seq in sequences], 0).tolist()
 
     if dtype is None:
         dtype = sequences[0].dtype
@@ -51,10 +54,9 @@ def pad_sequences(sequences: Sequence, constant_value=0, dtype=None) -> np.ndarr
     elif isinstance(sequences[0], torch.Tensor):
         array = torch.full(shape, constant_value, dtype=dtype)
 
-    for arr, seq in zip(array, sequences):
+    for arr, seq in zip(array, sequences): # 把原来的元素填充到对应的位置
         arrslice = tuple(slice(dim) for dim in seq.shape)
         arr[arrslice] = seq
-
     return array
 
 
@@ -627,20 +629,66 @@ class FluorescenceDataset(Dataset):
 
     def __getitem__(self, index: int):
         item = self.data[index]
+        score = float(item['log_fluorescence'][0])
         token_ids = self.tokenizer.encode(item['primary'])
         input_mask = np.ones_like(token_ids)
-        return token_ids, input_mask, float(item['log_fluorescence'][0])
+        graph_data = to_Graph(token_ids)
+
+        sub_sequences = devide_sequence(item['primary'],max_length=DEVIDE_LENGTH)
+        devided_token_ids = []
+        devided_input_masks = []
+        rws = []
+        arws = []
+        distances = [] 
+        for session in sub_sequences:
+            devided_token_id = self.tokenizer.encode(session)
+            devided_input_mask = np.ones_like(devided_token_id)
+            random_walk,anonymous_random_walk,distance = preprocess(devided_token_id)
+
+            devided_token_ids.append(devided_token_id)
+            devided_input_masks.append(devided_input_mask)
+            rws.append(random_walk)
+            arws.append(anonymous_random_walk)
+            distances.append(distance)
+
+        devided_token_ids = np.vstack(pad_sequences(devided_token_ids,0,devided_shape=[DEVIDE_LENGTH+2]))
+        devided_input_masks = np.vstack(pad_sequences(devided_input_masks,0,devided_shape=[DEVIDE_LENGTH+2]))
+        rws = np.array(pad_sequences(rws,0,devided_shape=[DEVIDE_LENGTH+2,NUM_PATH,WALK_LENGTH]))
+        arws = np.array(pad_sequences(arws,0,devided_shape=[DEVIDE_LENGTH+2,NUM_PATH,WALK_LENGTH]))
+        distances = np.array(pad_sequences(distances,-1,devided_shape=[DEVIDE_LENGTH+2,DEVIDE_LENGTH+2]))
+             
+        return token_ids, input_mask, score, graph_data, len(sub_sequences), \
+                devided_token_ids, devided_input_masks, rws, arws, distances, 
 
     def collate_fn(self, batch: List[Tuple[Any, ...]]) -> Dict[str, torch.Tensor]:
-        input_ids, input_mask, fluorescence_true_value = tuple(zip(*batch))
+        input_ids, input_mask, fluorescence_true_value, graph_data, index, \
+            devided_input_ids, devided_input_mask, random_walk, \
+                anonymous_random_walk, distance  = tuple(zip(*batch))
+        
         input_ids = torch.from_numpy(pad_sequences(input_ids, 0))
         input_mask = torch.from_numpy(pad_sequences(input_mask, 0))
+        devided_input_ids = torch.from_numpy(np.vstack(devided_input_ids))
+        devided_input_mask = torch.from_numpy(np.vstack(devided_input_mask))
+        random_walk = torch.from_numpy(np.concatenate(random_walk,axis=0)).long()
+        anonymous_random_walk = torch.from_numpy(np.concatenate(anonymous_random_walk,axis=0)).long()
+        distance = torch.from_numpy(np.concatenate(distance,axis=0)).long()
+    
         fluorescence_true_value = torch.FloatTensor(fluorescence_true_value)  # type: ignore
         fluorescence_true_value = fluorescence_true_value.unsqueeze(1)
+        index = torch.IntTensor(index)
+
+        graph_data = Batch.from_data_list(graph_data)
 
         return {'input_ids': input_ids,
                 'input_mask': input_mask,
-                'targets': fluorescence_true_value}
+                'targets': fluorescence_true_value,
+                'devided_input_ids': devided_input_ids,
+                'devided_input_mask': devided_input_mask,
+                'session_index':index,
+                'random_walk': random_walk,
+                'anonymous_random_walk': anonymous_random_walk,
+                'distance': distance,
+                'graph_data': graph_data }
 
 
 @registry.register_task('stability')
@@ -691,11 +739,11 @@ class StabilityDataset(Dataset):
             arws.append(anonymous_random_walk)
             distances.append(distance)
 
-        devided_token_ids = np.vstack(pad_sequences(devided_token_ids,0))
-        devided_input_masks = np.vstack(pad_sequences(devided_input_masks,0))
-        rws = np.array(pad_sequences(rws,0))
-        arws = np.array(pad_sequences(arws,0))
-        distances = np.array(pad_sequences(distances,-1))
+        devided_token_ids = np.vstack(pad_sequences(devided_token_ids,0,devided_shape=[DEVIDE_LENGTH+2]))
+        devided_input_masks = np.vstack(pad_sequences(devided_input_masks,0,devided_shape=[DEVIDE_LENGTH+2]))
+        rws = np.array(pad_sequences(rws,0,devided_shape=[DEVIDE_LENGTH+2,NUM_PATH,WALK_LENGTH]))
+        arws = np.array(pad_sequences(arws,0,devided_shape=[DEVIDE_LENGTH+2,NUM_PATH,WALK_LENGTH]))
+        distances = np.array(pad_sequences(distances,-1,devided_shape=[DEVIDE_LENGTH+2,DEVIDE_LENGTH+2]))
              
         return token_ids, input_mask, score, graph_data, len(sub_sequences), \
                 devided_token_ids, devided_input_masks, rws, arws, distances, 
@@ -707,11 +755,11 @@ class StabilityDataset(Dataset):
         
         input_ids = torch.from_numpy(pad_sequences(input_ids, 0))
         input_mask = torch.from_numpy(pad_sequences(input_mask, 0))
-        devided_input_ids = torch.from_numpy(np.vstack(pad_sequences(devided_input_ids,0)))
-        devided_input_mask = torch.from_numpy(np.vstack(pad_sequences(devided_input_mask,0)))
-        random_walk = torch.from_numpy(np.concatenate(pad_sequences(random_walk,0),axis=0)).long()
-        anonymous_random_walk = torch.from_numpy(np.concatenate(pad_sequences(anonymous_random_walk,0),axis=0)).long()
-        distance = torch.from_numpy(np.concatenate(pad_sequences(distance,-1),axis=0)).long()
+        devided_input_ids = torch.from_numpy(np.vstack(devided_input_ids))
+        devided_input_mask = torch.from_numpy(np.vstack(devided_input_mask))
+        random_walk = torch.from_numpy(np.concatenate(random_walk,axis=0)).long()
+        anonymous_random_walk = torch.from_numpy(np.concatenate(anonymous_random_walk,axis=0)).long()
+        distance = torch.from_numpy(np.concatenate(distance,axis=0)).long()
     
         stability_true_value = torch.FloatTensor(stability_true_value)  # type: ignore
         stability_true_value = stability_true_value.unsqueeze(1)
@@ -758,19 +806,65 @@ class RemoteHomologyDataset(Dataset):
 
     def __getitem__(self, index: int):
         item = self.data[index]
+        fold_label = item['fold_label']
         token_ids = self.tokenizer.encode(item['primary'])
         input_mask = np.ones_like(token_ids)
-        return token_ids, input_mask, item['fold_label']
+        graph_data = to_Graph(token_ids)
+
+        sub_sequences = devide_sequence(item['primary'],max_length=DEVIDE_LENGTH)
+        devided_token_ids = []
+        devided_input_masks = []
+        rws = []
+        arws = []
+        distances = [] 
+        for session in sub_sequences:
+            devided_token_id = self.tokenizer.encode(session)
+            devided_input_mask = np.ones_like(devided_token_id)
+            random_walk,anonymous_random_walk,distance = preprocess(devided_token_id)
+
+            devided_token_ids.append(devided_token_id)
+            devided_input_masks.append(devided_input_mask)
+            rws.append(random_walk)
+            arws.append(anonymous_random_walk)
+            distances.append(distance)
+
+        devided_token_ids = np.vstack(pad_sequences(devided_token_ids,0,devided_shape=[DEVIDE_LENGTH+2]))
+        devided_input_masks = np.vstack(pad_sequences(devided_input_masks,0,devided_shape=[DEVIDE_LENGTH+2]))
+        rws = np.array(pad_sequences(rws,0,devided_shape=[DEVIDE_LENGTH+2,NUM_PATH,WALK_LENGTH]))
+        arws = np.array(pad_sequences(arws,0,devided_shape=[DEVIDE_LENGTH+2,NUM_PATH,WALK_LENGTH]))
+        distances = np.array(pad_sequences(distances,-1,devided_shape=[DEVIDE_LENGTH+2,DEVIDE_LENGTH+2]))
+             
+        return token_ids, input_mask, fold_label, graph_data, len(sub_sequences), \
+                devided_token_ids, devided_input_masks, rws, arws, distances,  
 
     def collate_fn(self, batch: List[Tuple[Any, ...]]) -> Dict[str, torch.Tensor]:
-        input_ids, input_mask, fold_label = tuple(zip(*batch))
+        input_ids, input_mask, fold_label, graph_data, index, \
+            devided_input_ids, devided_input_mask, random_walk, \
+                anonymous_random_walk, distance  = tuple(zip(*batch))
+        
         input_ids = torch.from_numpy(pad_sequences(input_ids, 0))
         input_mask = torch.from_numpy(pad_sequences(input_mask, 0))
+        devided_input_ids = torch.from_numpy(np.vstack(devided_input_ids))
+        devided_input_mask = torch.from_numpy(np.vstack(devided_input_mask))
+        random_walk = torch.from_numpy(np.concatenate(random_walk,axis=0)).long()
+        anonymous_random_walk = torch.from_numpy(np.concatenate(anonymous_random_walk,axis=0)).long()
+        distance = torch.from_numpy(np.concatenate(distance,axis=0)).long()
+    
         fold_label = torch.LongTensor(fold_label)  # type: ignore
+        index = torch.IntTensor(index)
+
+        graph_data = Batch.from_data_list(graph_data)
 
         return {'input_ids': input_ids,
                 'input_mask': input_mask,
-                'targets': fold_label}
+                'targets': fold_label,
+                'devided_input_ids': devided_input_ids,
+                'devided_input_mask': devided_input_mask,
+                'session_index':index,
+                'random_walk': random_walk,
+                'anonymous_random_walk': anonymous_random_walk,
+                'distance': distance,
+                'graph_data': graph_data }
 
 
 @registry.register_task('contact_prediction')
@@ -811,19 +905,63 @@ class ProteinnetDataset(Dataset):
         invalid_mask |= np.abs(yind - xind) < 6
         contact_map[invalid_mask] = -1
 
-        return token_ids, input_mask, contact_map, protein_length
+        graph_data = to_Graph(token_ids)
+
+        sub_sequences = devide_sequence(item['primary'],max_length=DEVIDE_LENGTH)
+        devided_token_ids = []
+        devided_input_masks = []
+        rws = []
+        arws = []
+        distances = [] 
+        for session in sub_sequences:
+            devided_token_id = self.tokenizer.encode(session)
+            devided_input_mask = np.ones_like(devided_token_id)
+            random_walk,anonymous_random_walk,distance = preprocess(devided_token_id)
+
+            devided_token_ids.append(devided_token_id)
+            devided_input_masks.append(devided_input_mask)
+            rws.append(random_walk)
+            arws.append(anonymous_random_walk)
+            distances.append(distance)
+
+        devided_token_ids = np.vstack(pad_sequences(devided_token_ids,0,devided_shape=[DEVIDE_LENGTH+2]))
+        devided_input_masks = np.vstack(pad_sequences(devided_input_masks,0,devided_shape=[DEVIDE_LENGTH+2]))
+        rws = np.array(pad_sequences(rws,0,devided_shape=[DEVIDE_LENGTH+2,NUM_PATH,WALK_LENGTH]))
+        arws = np.array(pad_sequences(arws,0,devided_shape=[DEVIDE_LENGTH+2,NUM_PATH,WALK_LENGTH]))
+        distances = np.array(pad_sequences(distances,-1,devided_shape=[DEVIDE_LENGTH+2,DEVIDE_LENGTH+2]))
+
+        return token_ids, input_mask, contact_map, protein_length, graph_data, len(sub_sequences), \
+                devided_token_ids, devided_input_masks, rws, arws, distances,
 
     def collate_fn(self, batch: List[Tuple[Any, ...]]) -> Dict[str, torch.Tensor]:
-        input_ids, input_mask, contact_labels, protein_length = tuple(zip(*batch))
+        input_ids, input_mask, contact_labels, protein_length, graph_data, index, \
+            devided_input_ids, devided_input_mask, random_walk, \
+                anonymous_random_walk, distance  = tuple(zip(*batch))
         input_ids = torch.from_numpy(pad_sequences(input_ids, 0))
         input_mask = torch.from_numpy(pad_sequences(input_mask, 0))
         contact_labels = torch.from_numpy(pad_sequences(contact_labels, -1))
         protein_length = torch.LongTensor(protein_length)  # type: ignore
 
+        devided_input_ids = torch.from_numpy(np.vstack(devided_input_ids))
+        devided_input_mask = torch.from_numpy(np.vstack(devided_input_mask))
+        random_walk = torch.from_numpy(np.concatenate(random_walk,axis=0)).long()
+        anonymous_random_walk = torch.from_numpy(np.concatenate(anonymous_random_walk,axis=0)).long()
+        distance = torch.from_numpy(np.concatenate(distance,axis=0)).long()
+        index = torch.IntTensor(index)
+
+        graph_data = Batch.from_data_list(graph_data)
+
         return {'input_ids': input_ids,
                 'input_mask': input_mask,
                 'targets': contact_labels,
-                'protein_length': protein_length}
+                'protein_length': protein_length,
+                'devided_input_ids': devided_input_ids,
+                'devided_input_mask': devided_input_mask,
+                'session_index':index,
+                'random_walk': random_walk,
+                'anonymous_random_walk': anonymous_random_walk,
+                'distance': distance,
+                'graph_data': graph_data }
 
 
 @registry.register_task('secondary_structure', num_labels=3)
@@ -859,19 +997,61 @@ class SecondaryStructureDataset(Dataset):
         labels = np.asarray(item['ss3'], np.int64)
         labels = np.pad(labels, (1, 1), 'constant', constant_values=-1)
 
-        return token_ids, input_mask, labels
+        graph_data = to_Graph(token_ids)
+
+        sub_sequences = devide_sequence(item['primary'],max_length=DEVIDE_LENGTH)
+        devided_token_ids = []
+        devided_input_masks = []
+        rws = []
+        arws = []
+        distances = [] 
+        for session in sub_sequences:
+            devided_token_id = self.tokenizer.encode(session)
+            devided_input_mask = np.ones_like(devided_token_id)
+            random_walk,anonymous_random_walk,distance = preprocess(devided_token_id)
+
+            devided_token_ids.append(devided_token_id)
+            devided_input_masks.append(devided_input_mask)
+            rws.append(random_walk)
+            arws.append(anonymous_random_walk)
+            distances.append(distance)
+
+        devided_token_ids = np.vstack(pad_sequences(devided_token_ids,0,devided_shape=[DEVIDE_LENGTH+2]))
+        devided_input_masks = np.vstack(pad_sequences(devided_input_masks,0,devided_shape=[DEVIDE_LENGTH+2]))
+        rws = np.array(pad_sequences(rws,0,devided_shape=[DEVIDE_LENGTH+2,NUM_PATH,WALK_LENGTH]))
+        arws = np.array(pad_sequences(arws,0,devided_shape=[DEVIDE_LENGTH+2,NUM_PATH,WALK_LENGTH]))
+        distances = np.array(pad_sequences(distances,-1,devided_shape=[DEVIDE_LENGTH+2,DEVIDE_LENGTH+2]))
+
+        return token_ids, input_mask, labels, graph_data, len(sub_sequences), \
+                devided_token_ids, devided_input_masks, rws, arws, distances,  
 
     def collate_fn(self, batch: List[Tuple[Any, ...]]) -> Dict[str, torch.Tensor]:
-        input_ids, input_mask, ss_label = tuple(zip(*batch))
+        input_ids, input_mask, ss_label, graph_data, index, \
+            devided_input_ids, devided_input_mask, random_walk, \
+                anonymous_random_walk, distance  = tuple(zip(*batch))
         input_ids = torch.from_numpy(pad_sequences(input_ids, 0))
         input_mask = torch.from_numpy(pad_sequences(input_mask, 0))
         ss_label = torch.from_numpy(pad_sequences(ss_label, -1))
 
-        output = {'input_ids': input_ids,
-                  'input_mask': input_mask,
-                  'targets': ss_label}
+        devided_input_ids = torch.from_numpy(np.vstack(devided_input_ids))
+        devided_input_mask = torch.from_numpy(np.vstack(devided_input_mask))
+        random_walk = torch.from_numpy(np.concatenate(random_walk,axis=0)).long()
+        anonymous_random_walk = torch.from_numpy(np.concatenate(anonymous_random_walk,axis=0)).long()
+        distance = torch.from_numpy(np.concatenate(distance,axis=0)).long()
+        index = torch.IntTensor(index)
 
-        return output
+        graph_data = Batch.from_data_list(graph_data)
+
+        return {'input_ids': input_ids,
+                'input_mask': input_mask,
+                'targets': ss_label,
+                'devided_input_ids': devided_input_ids,
+                'devided_input_mask': devided_input_mask,
+                'session_index':index,
+                'random_walk': random_walk,
+                'anonymous_random_walk': anonymous_random_walk,
+                'distance': distance,
+                'graph_data': graph_data }
 
 
 @registry.register_task('trrosetta')

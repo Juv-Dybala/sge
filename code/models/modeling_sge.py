@@ -31,8 +31,10 @@ from tape import ProteinModel, ProteinConfig
 from .modeling_utils import prune_linear_layer
 from .modeling_utils import get_activation_fn
 from .modeling_utils import LayerNorm
+from .modeling_utils import SequenceClassificationHead
 from .modeling_utils import SequenceToSequenceClassificationHead
 from .modeling_utils import ValuePredictionHead
+from .modeling_utils import PairwiseContactPredictionHead
 from tape.registry import registry
 
 
@@ -68,10 +70,9 @@ class ProteinSGEConfig(ProteinConfig):
                  type_vocab_size: int = 2,
                  initializer_range: float = 0.02,
                  layer_norm_eps: float = 1e-12,
-                 max_sequence_length: int = 55, # include <cls> etc.
-                 num_path: int = 3,
-                 path_length: int = 5,
-                 beta: float = 1.0,
+                 num_path: int = 7,
+                 path_length: int = 15,
+                 beta: float = 1.05,
                  **kwargs):
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
@@ -86,7 +87,6 @@ class ProteinSGEConfig(ProteinConfig):
         self.type_vocab_size = type_vocab_size
         self.initializer_range = initializer_range
         self.layer_norm_eps = layer_norm_eps
-        self.max_sequence_length = max_sequence_length
         self.num_path = num_path
         self.path_length = path_length
         self.beta = beta
@@ -141,11 +141,14 @@ class ProteinSGESelfAttentionBias(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
+        # self.beta = nn.Parameter(torch.Tensor([1.0]))
         self.beta = config.beta
 
         self.path_embedding = ProteinSGEEmbeddingBias(config)
         self.distance_embedding = nn.Embedding(
             config.max_position_embeddings, config.num_attention_heads,padding_idx=0)
+
+        self.linear = nn.Linear(config.num_attention_heads,config.num_attention_heads)
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
@@ -168,6 +171,11 @@ class ProteinSGESelfAttentionBias(nn.Module):
             arw_embedding = self.transpose_for_scores(arw_embedding)
             arw_rpe = torch.matmul(arw_embedding, arw_embedding.transpose(-1, -2))
             attn_bias = attn_bias + arw_rpe
+
+        # [batch_size x num_head x seq_len x seq_len]
+        attn_bias = attn_bias.permute(0,2,3,1)
+        attn_bias = self.linear(attn_bias)
+        attn_bias = attn_bias.permute(0,3,1,2)
         return attn_bias
 
 
@@ -477,31 +485,48 @@ class ProteinSGEAggregator(nn.Module):
         self.gru = nn.GRU(config.hidden_size,config.hidden_size)
         self.hidden_size = config.hidden_size
     
-    def forward(self, sequence_output, pooled_output, session_index):
+    def pad_sequence_outputs(self,sequence_outputs):
+        max_lengrh = max([seq.shape[0] for seq in sequence_outputs])
+        padded_outputs = []
+        for seq_output in sequence_outputs:
+            pad_length = max_lengrh-seq_output.shape[0]
+            if pad_length:
+                zero_tensor = torch.zeros((pad_length,self.hidden_size)).to(device=seq_output.device)
+                padded_outputs.append(torch.cat((seq_output,zero_tensor),dim=0))
+            else:
+                padded_outputs.append(seq_output)
+        sequence_output = torch.stack(padded_outputs,dim=0)
+        return sequence_output
+
+    def forward(self, input_ids, sequence_output, pooled_output, session_index):
         session_index = session_index.tolist()
+        max_sequence_length = input_ids.shape[1]
         
         # aggregate sequence_output (token level)
         # 目前仅重组起止符并简单concatenate
-        sequence_output = list(torch.split(sequence_output,session_index,dim=0))
-        for i in range(len(sequence_output)):
-            num_of_subsequences = sequence_output[i].shape[0]
+        sequence_output_list = list(torch.split(sequence_output,session_index,dim=0))
+        concat_sequence_output = []
+        for seq_output in sequence_output_list:
+            num_of_subsequences = seq_output.shape[0]
             if num_of_subsequences == 1:
+                concat_sequence_output.append(seq_output.squeeze())
                 continue
             subsequences = []
-            subsequences.append(sequence_output[i][0,:-1,:])
-            for j in range(1,num_of_subsequences-1):
-                subsequences.append(sequence_output[i][j,1:-1,:])
-            subsequences.append(sequence_output[i][-1,1:,:])
-            subsequences.append(torch.zeros((num_of_subsequences*2-2,self.hidden_size)) \
-                                .to(device=sequence_output[i].device))
+            subsequences.append(seq_output[0,:-1,:])
+            for i in range(1,num_of_subsequences-1):
+                subsequences.append(seq_output[i,1:-1,:])
+            subsequences.append(seq_output[-1,1:,:])
+            subsequences.append(torch.zeros((num_of_subsequences*2-2,self.hidden_size)).to(device=seq_output.device))
+            concat_sequence_output.append(torch.cat(subsequences,dim=0).squeeze())
 
-            sequence_output[i] = torch.cat(subsequences,dim=0)
-        sequence_output = torch.stack(sequence_output,dim=0)
+        # concat_sequence_output: [seq_len(maybe UNequal!) x hidden_size]
+        sequence_output = self.pad_sequence_outputs(concat_sequence_output)
+        sequence_output = sequence_output[:,:max_sequence_length,:]
 
         # aggregate pooled_output (sequence level)
         # 使用GRU聚合
         pooled_output = list(torch.split(pooled_output,session_index,dim=0))
-        for i in range(len(pooled_output)):
+        for i in range(len(pooled_output)): # 对每一组分别处理,共batch_size组
             _,pooled_output[i] = self.gru(pooled_output[i])
         pooled_output = torch.cat(pooled_output,dim=0)
 
@@ -595,8 +620,8 @@ class ProteinSGEModel(ProteinSGEAbstractModel):
         pooled_output = self.pooler(sequence_output) # [sub_batch_size x hidden_size]
         
         # 聚合子序列
-        sequence_output,pooled_output = self.aggregator(sequence_output,pooled_output,session_index)
-
+        sequence_output,pooled_output = self.aggregator(input_ids,sequence_output,pooled_output,session_index)
+        
         # add hidden_states and attentions if they are here
         outputs = (sequence_output, pooled_output,) + encoder_outputs[1:]
 
@@ -617,9 +642,12 @@ class ProteinSGEForSequenceToSequenceClassification(ProteinSGEAbstractModel):
         # is present in every config (it's an argument of ProteinConfig)
         # and is used for classification tasks.
         self.classify = SequenceToSequenceClassificationHead(
-            config.hidden_size, config.num_labels)
+            config.hidden_size, config.num_labels, ignore_index=-1)
 
-    def forward(self, input_ids, input_mask=None, targets=None):
+        self.init_weights()
+
+    def forward(self, input_ids, devided_input_ids, devided_input_mask=None, targets=None, session_index=None,
+                random_walk=None, anonymous_random_walk=None, distance=None):
         """ Runs the forward model pass and may compute the loss if targets
             is present. Note that this does expect the third argument to be named
             `targets`. You can look at the different defined models to see
@@ -634,16 +662,12 @@ class ProteinSGEForSequenceToSequenceClassification(ProteinSGEAbstractModel):
             targets (Tensor[long], optional):
                 Tensor of output target labels of shape [batch_size x protein_length]
         """
-        outputs = self.sge(input_ids, input_mask)
-        sequence_embedding = outputs[0]
-        
-        print("breakpoint 1")
-        exit()
-        prediction = self.classify(sequence_embedding)
-
-        outputs = (prediction,)
-
-        return outputs  # ((loss, metrics)), prediction
+        outputs = self.sge(input_ids, devided_input_ids, devided_input_mask, session_index, 
+                           random_walk, anonymous_random_walk,distance)
+        sequence_output, pooled_output = outputs[:2]
+        outputs = self.classify(sequence_output, targets) + outputs[2:]
+        # (loss), prediction_scores, (hidden_states), (attentions)
+        return outputs
 
 
 @registry.register_task_model('fluorescence', 'sge')
@@ -672,4 +696,55 @@ class ProteinSGEForValuePrediction(ProteinSGEAbstractModel):
         outputs = self.predict(pooled_output, targets) + outputs[2:]
         # (loss), prediction_scores, (hidden_states), (attentions)
 
+        return outputs
+    
+
+@registry.register_task_model('remote_homology', 'sge')
+class ProteinSGEForSequenceClassification(ProteinSGEAbstractModel):
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.sge = ProteinSGEModel(config)
+        self.classify = SequenceClassificationHead(
+            config.hidden_size, config.num_labels)
+
+        self.init_weights()
+
+    def forward(self, input_ids, devided_input_ids, devided_input_mask=None, targets=None, session_index=None,
+                random_walk=None, anonymous_random_walk=None, distance=None):
+
+        # targets、session_index: [batch_size]
+        # random_walk、anonymous_random_walk: [sub_batch_size x sequence_length x path_num x path_length]
+        # distance: [sub_batch_size x sequence_length x sequence_length]
+
+        outputs = self.sge(input_ids, devided_input_ids, devided_input_mask, session_index, 
+                           random_walk, anonymous_random_walk,distance)
+
+        sequence_output, pooled_output = outputs[:2]
+        outputs = self.classify(pooled_output, targets) + outputs[2:]
+        # (loss), prediction_scores, (hidden_states), (attentions)
+        return outputs
+
+
+@registry.register_task_model('contact_prediction', 'sge')
+class ProteinSGEForContactPrediction(ProteinSGEAbstractModel):
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.sge = ProteinSGEModel(config)
+        self.predict = PairwiseContactPredictionHead(config.hidden_size, ignore_index=-1)
+
+        self.init_weights()
+
+    def forward(self, input_ids, protein_length, devided_input_ids, devided_input_mask=None, targets=None, 
+                session_index=None,random_walk=None, anonymous_random_walk=None, distance=None):
+
+        outputs = self.sge(input_ids, devided_input_ids, devided_input_mask, session_index, 
+                           random_walk, anonymous_random_walk,distance)
+
+        sequence_output, pooled_output = outputs[:2]
+        outputs = self.predict(sequence_output, protein_length, targets) + outputs[2:]
+        # (loss), prediction_scores, (hidden_states), (attentions)
         return outputs
