@@ -59,10 +59,10 @@ class ProteinSGEConfig(ProteinConfig):
 
     def __init__(self,
                  vocab_size: int = 30,
-                 hidden_size: int = 768,
-                 num_hidden_layers: int = 12,
-                 num_attention_heads: int = 12,
-                 intermediate_size: int = 3072,
+                 hidden_size: int = 64,
+                 num_hidden_layers: int = 6,
+                 num_attention_heads: int = 8,
+                 intermediate_size: int = 256,
                  hidden_act: str = "gelu",
                  hidden_dropout_prob: float = 0.1,
                  attention_probs_dropout_prob: float = 0.1,
@@ -71,7 +71,7 @@ class ProteinSGEConfig(ProteinConfig):
                  initializer_range: float = 0.02,
                  layer_norm_eps: float = 1e-12,
                  num_path: int = 7,
-                 path_length: int = 15,
+                 path_length: int = 20,
                  beta: float = 1.05,
                  **kwargs):
         super().__init__(**kwargs)

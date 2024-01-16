@@ -18,9 +18,9 @@ from .registry import registry
 
 logger = logging.getLogger(__name__)
 
-NUM_PATH = 7
-WALK_LENGTH = 15
-DEVIDE_LENGTH = 100
+NUM_PATH = 10
+WALK_LENGTH = 20
+DEVIDE_LENGTH = 400
 
 
 def dataset_factory(data_file: Union[str, Path], *args, **kwargs) -> Dataset:

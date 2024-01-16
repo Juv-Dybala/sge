@@ -133,7 +133,7 @@ class ProteinGNNOutput(nn.Module):
             sequence_outputs.append(sequence_output)
 
         graph_outputs = torch.vstack(graph_outputs)
-        sequence_outputs = tuple(sequence_outputs)
+        sequence_outputs = torch.stack(sequence_outputs,dim=0)
             
         return sequence_outputs,graph_outputs
 
@@ -256,6 +256,7 @@ class ProteinGNNForSequenceToSequenceClassification(ProteinGNNAbstractModel):
         outputs = self.gnn(input_ids, x, edge_index, edge_attr, ptr)
 
         sequence_output, pooled_output = outputs[:2]
+
         outputs = self.classify(sequence_output, targets) + outputs[2:]
         # (loss), prediction_scores, (hidden_states), (attentions)
         return outputs
