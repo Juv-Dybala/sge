@@ -10,7 +10,7 @@ import lmdb
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 from scipy.spatial.distance import pdist, squareform
 
 from .tokenizers import TAPETokenizer
@@ -886,7 +886,15 @@ class ProteinnetDataset(Dataset):
 
         data_path = Path(data_path)
         data_file = f'proteinnet/proteinnet_{split}.lmdb'
-        self.data = dataset_factory(data_path / data_file, in_memory)
+        whole_data = dataset_factory(data_path / data_file, in_memory)
+
+        def _filter_too_long(dataset, threshold=1500):
+            idxs = []
+            for i in range(len(dataset)):
+                if dataset[i]['protein_length'] <= threshold:
+                    idxs.append(i)
+            return Subset(dataset,idxs)
+        self.data = _filter_too_long(whole_data)
 
     def __len__(self) -> int:
         return len(self.data)
