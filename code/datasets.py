@@ -67,7 +67,7 @@ def devide_sequence(sequence: Sequence, max_length: int) -> List[Sequence]:
     return [sequence[i*max_length:(i+1)*max_length] for i in range(split_num)]
 
 
-def shortest_distance(sequence: Sequence) -> Dict[object,Dict]:
+def shortest_distance(sequence: Sequence):
     # 计算节点对之间距离：O(N^2)，对每一个节点，双指针向两侧延伸更新
     shortest_distance = {}
     
@@ -101,8 +101,18 @@ def shortest_distance(sequence: Sequence) -> Dict[object,Dict]:
                 if target in shortest_distance:
                     shortest_distance[target][item] = distance
             right += 1
+        
+    distance_matrix = np.zeros((len(sequence),len(sequence)))
+    for i in range(len(sequence)):
+        for j in range(len(sequence)):
+            distance_matrix[i,j] = shortest_distance[sequence[i]][sequence[j]]
     
     return shortest_distance
+
+
+def shortest_distance_anchor(sequence: Sequence, node_pos: Dict[object,List]):
+    # TODO:计算节点对之间距离：O(kN), 先寻找anchor节点，然后计算与anchor的最短路径
+    pass
 
 
 def generate_random_walk(start_node: object, node_neighbors: Dict[object,List], 
@@ -193,12 +203,9 @@ def preprocess(sequence: Sequence):
     RW = np.concatenate([padding_path,RW,padding_path])
     ARW = np.concatenate([padding_path,ARW,padding_path])
     
-    shortest_distance_dict = shortest_distance(sequence)
     # 最短距离矩阵，用于RPE
-    distance_matrix = np.zeros((len(sequence),len(sequence)))
-    for i in range(len(sequence)):
-        for j in range(len(sequence)):
-            distance_matrix[i,j] = shortest_distance_dict[sequence[i]][sequence[j]]
+    # distance_matrix = shortest_distance(sequence)
+    distance_matrix =shortest_distance_anchor(sequence, node_pos)
     distance_matrix = np.pad(distance_matrix,(1,1),'constant',constant_values=-1)
 
     return RW,ARW,distance_matrix
@@ -894,6 +901,7 @@ class ProteinnetDataset(Dataset):
                 if dataset[i]['protein_length'] <= threshold:
                     idxs.append(i)
             return Subset(dataset,idxs)
+
         self.data = _filter_too_long(whole_data)
 
     def __len__(self) -> int:
